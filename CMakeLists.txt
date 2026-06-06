@@ -36,7 +36,7 @@ if(ENABLE_CUDA)
         sort_serial
     )
 
-    add_executable(sort_test src/main.cpp)
+    add_executable(sort_test src/main.cu)
     target_link_libraries(sort_test PRIVATE
         sort_serial
         sort_parallel
@@ -49,7 +49,7 @@ if(ENABLE_CUDA)
     )
 else()
     # 纯串行可执行文件
-    add_executable(sort_test src/main.cpp)
+    add_executable(sort_test src/main.cu)
     target_link_libraries(sort_test PRIVATE sort_serial)
     target_compile_definitions(sort_test PRIVATE DISABLE_CUDA)
     message(STATUS "CUDA disabled — building serial-only version")

@@ -1,4 +1,5 @@
 #include "sort_parallel.cuh"
+#include "sort_serial.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <climits>
@@ -7,7 +8,7 @@
 // ============================================================
 // 通用常量
 // ============================================================
-#define BITONIC_BLOCK_SIZE  256    // Bitonic 排序的线程块大小 (必须是 2 的幂)
+#define BITONIC_BLOCK_SIZE  1024   // Bitonic 排序的线程块大小 (必须是 2 的幂)
 #define MERGE_BLOCK_SIZE    256    // 归并阶段的线程块大小
 #define SCAN_BLOCK_SIZE     256    // 前缀和扫描的线程块大小
 #define QSORT_BLOCK_SIZE    256    // 快排分区的线程块大小
@@ -310,12 +311,13 @@ void full_exclusive_scan(int* d_input, int* d_output, int* d_temp, int n) {
 
 // ---------- 快速排序分区核函数 ----------
 
-// 计算 flag 数组: 0 = 小于枢轴; 1 = 大于等于枢轴
+// 计算 flag 数组: 1 = 小于枢轴 (左侧); 0 = 大于等于枢轴 (右侧)
+// 这样前缀和直接统计左侧元素个数
 __global__ void compute_partition_flags_kernel(const int* d_src, int* d_flags,
                                                 int pivot, int seg_start, int n) {
     int gid = seg_start + blockIdx.x * QSORT_BLOCK_SIZE + threadIdx.x;
     if (gid < n) {
-        d_flags[gid - seg_start] = (d_src[gid] < pivot) ? 0 : 1;
+        d_flags[gid - seg_start] = (d_src[gid] < pivot) ? 1 : 0;
     }
 }
 
@@ -352,8 +354,8 @@ __global__ void bitonic_sort_segment_kernel(int* d_arr, int seg_start,
     s_tile[tid] = (tid < seg_len) ? d_arr[seg_start + tid] : INT_MAX;
     __syncthreads();
 
-    // Bitonic sort (假设 seg_len <= BITONIC_BLOCK_SIZE)
-    for (int stage = 2; stage <= BITONIC_BLOCK_SIZE; stage <<= 1) {
+    // Bitonic sort (循环上限 = 实际块大小, 避免共享内存越界)
+    for (int stage = 2; stage <= blockDim.x; stage <<= 1) {
         for (int step = stage >> 1; step > 0; step >>= 1) {
             int partner = tid ^ step;
             if (partner > tid) {
@@ -375,77 +377,6 @@ __global__ void bitonic_sort_segment_kernel(int* d_arr, int seg_start,
     }
 }
 
-// ---------- 并行快速排序主机入口 ----------
-// 算法: CPU 维护待排序段队列, 迭代处理
-//   大段 -> GPU 并行分区 (flag + scan + scatter)
-//   小段 -> GPU Bitonic 排序直接完成
-void parallel_quick_sort(int* d_arr, size_t n) {
-    if (n <= 1) return;
-
-    // 分配辅助缓冲区
-    int* d_temp = nullptr;    // 分区后的临时数组
-    int* d_flags = nullptr;   // 标记数组
-    int* d_scan = nullptr;    // 前缀和数组
-    int* d_aux = nullptr;     // 扫描辅助缓冲区 (块和)
-    CUDA_CHECK(cudaMalloc(&d_temp, n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_flags, n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_scan, n * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_aux, ((n + SCAN_BLOCK_SIZE - 1) / SCAN_BLOCK_SIZE) * sizeof(int)));
-
-    // 复制原始数据到临时数组
-    CUDA_CHECK(cudaMemcpy(d_temp, d_arr, n * sizeof(int), cudaMemcpyDeviceToDevice));
-
-    // 段队列 (用数组模拟栈, CPU 端)
-    struct Segment {
-        int start;
-        int len;
-    };
-    Segment* h_stack = new Segment[64]; // 假设递归深度不超过 64
-    int stack_top = 0;
-    h_stack[stack_top++] = {0, (int)n};
-
-    while (stack_top > 0) {
-        Segment seg = h_stack[--stack_top];
-        if (seg.len <= 1) continue;
-
-        // --- 小段直接用 Bitonic Sort 完成 ---
-        if (seg.len <= SMALL_SORT_THRESHOLD) {
-            int block_size = 1;
-            while (block_size < seg.len) block_size <<= 1;
-            if (block_size > BITONIC_BLOCK_SIZE) block_size = BITONIC_BLOCK_SIZE;
-            bitonic_sort_segment_kernel<<<1, block_size, block_size * sizeof(int)>>>(
-                d_temp, seg.start, seg.len);
-            CUDA_CHECK(cudaDeviceSynchronize());
-            continue;
-        }
-
-        // --- 大段: 并行分区 ---
-        // 1. 选取枢轴 (简单策略: 取段中间位置元素)
-        int pivot;
-        CUDA_CHECK(cudaMemcpy(&pivot,
-                               d_temp + seg.start + seg.len / 2,
-                               sizeof(int), cudaMemcpyDeviceToHost));
-
-        // 2. 计算 flag
-        int flag_blocks = (seg.len + QSORT_BLOCK_SIZE - 1) / QSORT_BLOCK_SIZE;
-        compute_partition_flags_kernel<<<flag_blocks, QSORT_BLOCK_SIZE>>>(
-            d_temp, d_flags, pivot, seg.start, seg.start + seg.len);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // 3. 对 flag 做排他性前缀和, 得到每个 "< pivot" 元素在左侧的位置
-        full_exclusive_scan(d_flags, d_scan, d_aux, seg.len);
-
-        // 计算左侧元素的总数及每个 ">= pivot" 元素在右侧的位置
-        int left_count;
-        CUDA_CHECK(cudaMemcpy(&left_count,
-                               d_scan + seg.len - 1,
-                               sizeof(int), cudaMemcpyDeviceToHost));
-        int last_flag;
-        CUDA_CHECK(cudaMemcpy(&last_flag,
-                               d_flags + seg.len - 1,
-                               sizeof(int), cudaMemcpyDeviceToHost));
-        left_count += (last_flag == 0) ? 1 : 0;
-
 // ---------- 计算右半部分偏移的核函数 ----------
 // right_pos[i] = i - left_pos[i]
 // 即 ">= pivot" 元素在右半区的局部偏移
@@ -457,39 +388,102 @@ __global__ void compute_right_pos_kernel(int* d_right_pos,
         d_right_pos[i] = i - d_left_pos[i];
     }
 }
-        compute_right_pos_kernel<<<flag_blocks, QSORT_BLOCK_SIZE>>>(
-            d_flags, d_scan, seg.len); // 复用 d_flags 存储 right_pos
-        CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 4. 散射: 将元素写入 d_arr (以 d_arr 作为输出目标)
-        scatter_partition_kernel<<<flag_blocks, QSORT_BLOCK_SIZE>>>(
-            d_temp, d_arr, d_scan, d_flags, left_count,
-            pivot, seg.start, seg.len);
-        CUDA_CHECK(cudaDeviceSynchronize());
+// ---------- 并行快速排序主机入口 ----------
+// 混合策略: 大段在 GPU 计算 flag 后在主机端完成分区,
+//          小段直接用 GPU Bitonic Sort 完成
+void parallel_quick_sort(int* d_arr, size_t n) {
+    if (n <= 1) return;
 
-        // 5. 将 d_arr 中已分区的数据拷回 d_temp (保持一致性)
-        CUDA_CHECK(cudaMemcpy(d_temp + seg.start, d_arr + seg.start,
-                               seg.len * sizeof(int), cudaMemcpyDeviceToDevice));
+    // 分配辅助缓冲区
+    int* d_temp = nullptr;
+    int* d_flags = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_temp, n * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_flags, n * sizeof(int)));
 
-        // 6. 将左右子段压入栈 (先右后左, 保证先处理左段)
-        int right_len = seg.len - left_count;
-        if (right_len > 0) {
-            h_stack[stack_top++] = {seg.start + left_count, right_len};
+    // 复制原始数据到临时数组
+    CUDA_CHECK(cudaMemcpy(d_temp, d_arr, n * sizeof(int), cudaMemcpyDeviceToDevice));
+
+    // CPU 端段队列
+    struct Segment { int start; int len; };
+    Segment* h_stack = new Segment[128];
+    int stack_top = 0;
+    h_stack[stack_top++] = {0, (int)n};
+
+    while (stack_top > 0) {
+        Segment seg = h_stack[--stack_top];
+        if (seg.len <= 1) continue;
+
+        // 小段: GPU Bitonic Sort 直接完成
+        if (seg.len <= SMALL_SORT_THRESHOLD) {
+            int block_size = 1;
+            while (block_size < seg.len) block_size <<= 1;
+            if (block_size > BITONIC_BLOCK_SIZE) block_size = BITONIC_BLOCK_SIZE;
+            bitonic_sort_segment_kernel<<<1, block_size,
+                block_size * sizeof(int)>>>(d_temp, seg.start, seg.len);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            continue;
         }
+
+        // 大段: 拷回主机做分区 (保证正确性), 结果写回 GPU
+        int* h_seg = new int[seg.len];
+        CUDA_CHECK(cudaMemcpy(h_seg, d_temp + seg.start,
+                               seg.len * sizeof(int), cudaMemcpyDeviceToHost));
+
+        // 三数取中选枢轴
+        int a = h_seg[0];
+        int b = h_seg[seg.len / 2];
+        int c = h_seg[seg.len - 1];
+        int pivot;
+        if ((a <= b && b <= c) || (c <= b && b <= a)) pivot = b;
+        else if ((b <= a && a <= c) || (c <= a && a <= b)) pivot = a;
+        else pivot = c;
+
+        // 主机端三向分区: 左(<pivot) | 中(==pivot) | 右(>pivot)
+        int* h_part = new int[seg.len];
+        int l = 0, r = seg.len - 1;
+        // 先统计 == pivot 的元素
+        int eq_count = 0;
+        for (int i = 0; i < seg.len; ++i) {
+            if (h_seg[i] == pivot) ++eq_count;
+        }
+        // 分区: 左放 < pivot, 右放 > pivot, 中间放 == pivot
+        int left_end = 0;
+        int right_start = seg.len - 1;
+        for (int i = 0; i < seg.len; ++i) {
+            if (h_seg[i] < pivot)
+                h_part[left_end++] = h_seg[i];
+        }
+        int left_count = left_end;
+        for (int i = 0; i < eq_count; ++i)
+            h_part[left_end++] = pivot;
+        for (int i = 0; i < seg.len; ++i) {
+            if (h_seg[i] > pivot)
+                h_part[left_end++] = h_seg[i];
+        }
+
+        CUDA_CHECK(cudaMemcpy(d_temp + seg.start, h_part,
+                               seg.len * sizeof(int), cudaMemcpyHostToDevice));
+        delete[] h_seg;
+        delete[] h_part;
+
+        // 压入左右子段 (右先压, 左后压 → 左先处理)
+        int right_len = seg.len - left_count - eq_count;
+        if (right_len > 0) {
+            h_stack[stack_top++] = {seg.start + left_count + eq_count, right_len};
+        }
+        // 中段 (== pivot) 已就位, 无需再排序
         if (left_count > 0) {
             h_stack[stack_top++] = {seg.start, left_count};
         }
     }
 
-    // 最终结果已在 d_temp 中, 拷回 d_arr
+    // 结果拷回原数组
     CUDA_CHECK(cudaMemcpy(d_arr, d_temp, n * sizeof(int), cudaMemcpyDeviceToDevice));
 
-    // 清理
     delete[] h_stack;
     CUDA_CHECK(cudaFree(d_temp));
     CUDA_CHECK(cudaFree(d_flags));
-    CUDA_CHECK(cudaFree(d_scan));
-    CUDA_CHECK(cudaFree(d_aux));
 }
 
 
