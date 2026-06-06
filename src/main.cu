@@ -224,6 +224,10 @@ int main(int argc, char* argv[]) {
 
     // --- Selection Sort ---
     {
+        if (N > 10000) {
+            printf("  Skipping serial_selection_sort for large N (%zu) ...\n",  N);
+        }
+        else {
             int* arr = copy_array(original, N);
             auto t0 = Clock::now();
             serial_selection_sort(arr, N);
@@ -239,6 +243,7 @@ int main(int argc, char* argv[]) {
             } else {
                 delete[] arr;
             }
+        }
     }
 
     // ============================================================
