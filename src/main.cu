@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
 
     // --- Selection Sort ---
     {
-        if (N > 10000) {
+        if (N >= 1e5) {
             printf("  Skipping serial_selection_sort for large N (%zu) ...\n",  N);
         }
         else {
